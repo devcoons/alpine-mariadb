@@ -1,9 +1,9 @@
 #!/bin/sh
-/* ---------------------------------------------------------------------- */
-/* Filepath: /docker/entrypoint.sh                                        */
-/* ---------------------------------------------------------------------- */
-/* Section: helpers                                                       */
-/* ---------------------------------------------------------------------- */
+# ----------------------------------------------------------------------
+# Filepath: /docker/entrypoint.sh
+# ----------------------------------------------------------------------
+# Section: helpers
+# ----------------------------------------------------------------------
 
 # Function to read secret from file
 read_secret() {
@@ -26,8 +26,8 @@ for var in ROOT_PASSWORD DATABASE USER PASSWORD CHARSET COLLATION; do
     fi
 
     # Check secrets
-    mysql_secret="/run/secrets/mysql_$(echo $var | tr '[:upper:]' '[:lower:]')"
-    mariadb_secret="/run/secrets/mariadb_$(echo $var | tr '[:upper:]' '[:lower:]')"
+    mysql_secret="/run/secrets/mysql_$(echo "$var" | tr '[:upper:]' '[:lower:]')"
+    mariadb_secret="/run/secrets/mariadb_$(echo "$var" | tr '[:upper:]' '[:lower:]')"
 
     if [ -z "$mysql_var" ] && [ -f "$mariadb_secret" ]; then
         eval "export MYSQL_${var}=$(read_secret "$mariadb_secret")"
@@ -58,9 +58,9 @@ elif [ -z "${MYSQL_DATABASES:-}" ] && [ -n "${MARIADB_DATABASES_FILE:-}" ]; then
     MYSQL_DATABASES="$(read_secret "$MARIADB_DATABASES_FILE")"
 fi
 
-/* ---------------------------------------------------------------------- */
-/* Section: pre-init                                                      */
-/* ---------------------------------------------------------------------- */
+# ----------------------------------------------------------------------
+# Section: pre-init
+# ----------------------------------------------------------------------
 
 # execute any pre-init scripts
 for i in /scripts/pre-init.d/*sh
@@ -140,67 +140,82 @@ else
 
     tfile=$(mktemp)
     if [ ! -f "$tfile" ]; then
-        return 1
+        exit 1
     fi
 
     cat << EOF > "$tfile"
 USE mysql;
 FLUSH PRIVILEGES ;
-GRANT ALL ON *.* TO 'root'@'%' identified by '$MYSQL_ROOT_PASSWORD' WITH GRANT OPTION ;
-GRANT ALL ON *.* TO 'root'@'localhost' identified by '$MYSQL_ROOT_PASSWORD' WITH GRANT OPTION ;
+GRANT ALL ON *.* TO 'root'@'%' IDENTIFIED BY '$MYSQL_ROOT_PASSWORD' WITH GRANT OPTION ;
+GRANT ALL ON *.* TO 'root'@'localhost' IDENTIFIED BY '$MYSQL_ROOT_PASSWORD' WITH GRANT OPTION ;
 SET PASSWORD FOR 'root'@'localhost'=PASSWORD('${MYSQL_ROOT_PASSWORD}') ;
 DROP DATABASE IF EXISTS test ;
 FLUSH PRIVILEGES ;
 EOF
 
-    # Helper to append SQL for creating a DB and (optionally) granting user access
+    # helper: append DB creation + grant (explicit user create/alter)
     append_db_sql() {
         _db="$1"
-        if [ -z "$_db" ]; then
-            return
-        fi
-        # Choose charset/collation
+        [ -z "$_db" ] && return
+
         if [ -n "${MYSQL_CHARSET:-}" ] && [ -n "${MYSQL_COLLATION:-}" ]; then
             echo "CREATE DATABASE IF NOT EXISTS \`$_db\` CHARACTER SET ${MYSQL_CHARSET} COLLATE ${MYSQL_COLLATION};" >> "$tfile"
         else
             echo "CREATE DATABASE IF NOT EXISTS \`$_db\` CHARACTER SET utf8 COLLATE utf8_general_ci;" >> "$tfile"
         fi
-        # Grant to user if present
+
         if [ -n "${MYSQL_USER:-}" ]; then
-            echo "GRANT ALL ON \`$_db\`.* TO '${MYSQL_USER}'@'%' IDENTIFIED BY '${MYSQL_PASSWORD}';" >> "$tfile"
+            # Create the account if missing, then set/ensure the password, then grant
+            echo "CREATE USER IF NOT EXISTS '${MYSQL_USER}'@'%' IDENTIFIED BY '${MYSQL_PASSWORD}';" >> "$tfile"
+            echo "ALTER USER '${MYSQL_USER}'@'%' IDENTIFIED BY '${MYSQL_PASSWORD}';" >> "$tfile"
+            echo "GRANT ALL ON \`$_db\`.* TO '${MYSQL_USER}'@'%';" >> "$tfile"
         fi
     }
 
-    if [ "$MYSQL_DATABASE" != "" ]; then
+    # Primary single DB (unchanged logic)
+    if [ -n "$MYSQL_DATABASE" ]; then
         echo "[i] Creating database: $MYSQL_DATABASE"
-        if [ "$MYSQL_CHARSET" != "" ] && [ "$MYSQL_COLLATION" != "" ]; then
+        if [ -n "$MYSQL_CHARSET" ] && [ -n "$MYSQL_COLLATION" ]; then
             echo "[i] with character set [$MYSQL_CHARSET] and collation [$MYSQL_COLLATION]"
             echo "CREATE DATABASE IF NOT EXISTS \`$MYSQL_DATABASE\` CHARACTER SET $MYSQL_CHARSET COLLATE $MYSQL_COLLATION;" >> "$tfile"
         else
             echo "[i] with character set: 'utf8' and collation: 'utf8_general_ci'"
             echo "CREATE DATABASE IF NOT EXISTS \`$MYSQL_DATABASE\` CHARACTER SET utf8 COLLATE utf8_general_ci;" >> "$tfile"
         fi
-
-        if [ "$MYSQL_USER" != "" ]; then
+        if [ -n "$MYSQL_USER" ]; then
             echo "[i] Creating user: $MYSQL_USER with password $MYSQL_PASSWORD"
-            echo "GRANT ALL ON \`$MYSQL_DATABASE\`.* to '$MYSQL_USER'@'%' IDENTIFIED BY '$MYSQL_PASSWORD';" >> "$tfile"
+            echo "CREATE USER IF NOT EXISTS '$MYSQL_USER'@'%' IDENTIFIED BY '$MYSQL_PASSWORD';" >> "$tfile"
+            echo "ALTER USER '$MYSQL_USER'@'%' IDENTIFIED BY '$MYSQL_PASSWORD';" >> "$tfile"
+            echo "GRANT ALL ON \`$MYSQL_DATABASE\`.* TO '$MYSQL_USER'@'%';" >> "$tfile"
         fi
     fi
 
-    # Handle multiple databases from MYSQL_DATABASES (comma/semicolon/whitespace separated)
+    # Multiple DBs (split on commas, semicolons, or any whitespace)
     if [ -n "${MYSQL_DATABASES:-}" ]; then
         echo "[i] Creating additional databases from MYSQL_DATABASES"
-        # Normalize separators to spaces: commas and semicolons -> space
-        _dbs="$(printf '%s' "$MYSQL_DATABASES" | tr ',;' '  ')"
-        for _db in $_dbs; do
-            # Skip duplicates with the primary MYSQL_DATABASE
+
+        # Turn commas, semicolons, and ANY whitespace into newlines; drop empties
+        _dbs_norm="$(printf '%s' "$MYSQL_DATABASES" \
+            | tr ',;[:space:]' '\n' \
+            | awk 'NF')"
+
+        # Disable globbing to avoid pathname expansion
+        set -f
+        old_ifs="$IFS"
+        IFS='
+'
+        for _db in $_dbs_norm; do
+            # Skip duplicate of primary
             if [ -n "$MYSQL_DATABASE" ] && [ "$_db" = "$MYSQL_DATABASE" ]; then
                 continue
             fi
             echo "[i] - $_db"
             append_db_sql "$_db"
         done
+        IFS="$old_ifs"
+        set +f
     fi
+
 
     /usr/bin/mariadbd --user=mysql --bootstrap --verbose=0 --skip-name-resolve --skip-networking=0 < "$tfile"
     rm -f "$tfile"
@@ -251,9 +266,9 @@ EOF
     echo "exec /usr/bin/mariadbd --user=mysql --console --skip-name-resolve --skip-networking=0" "$@"
 fi
 
-/* ---------------------------------------------------------------------- */
-/* Section: exec                                                          */
-/* ---------------------------------------------------------------------- */
+# ----------------------------------------------------------------------
+# Section: exec
+# ----------------------------------------------------------------------
 
 # execute any pre-exec scripts
 for i in /scripts/pre-exec.d/*sh
@@ -266,6 +281,6 @@ done
 
 exec /usr/bin/mariadbd --user=mysql --console --skip-name-resolve --skip-networking=0 "$@"
 
-/* ---------------------------------------------------------------------- */
-/* End of file                                                            */
-/* ---------------------------------------------------------------------- */
+# ----------------------------------------------------------------------
+# End of file
+# ----------------------------------------------------------------------
