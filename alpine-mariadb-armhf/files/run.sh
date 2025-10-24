@@ -1,4 +1,9 @@
 #!/bin/sh
+/* ---------------------------------------------------------------------- */
+/* Filepath: /docker/entrypoint.sh                                        */
+/* ---------------------------------------------------------------------- */
+/* Section: helpers                                                       */
+/* ---------------------------------------------------------------------- */
 
 # Function to read secret from file
 read_secret() {
@@ -43,6 +48,32 @@ for var in ROOT_PASSWORD DATABASE USER PASSWORD; do
         eval "export MYSQL_${var}=$(read_secret "$mariadb_file_var")"
     fi
 done
+
+# Support plural DATABASES as a list (comma/semicolon/whitespace separated)
+# Map MARIADB_DATABASES -> MYSQL_DATABASES when MYSQL_DATABASES unset
+if [ -z "${MYSQL_DATABASES:-}" ] && [ -n "${MARIADB_DATABASES:-}" ]; then
+    export MYSQL_DATABASES="${MARIADB_DATABASES}"
+fi
+
+# Secrets for plural DATABASES (prefer mariadb_ like single-var behavior)
+if [ -z "${MYSQL_DATABASES:-}" ]; then
+    if [ -f "/run/secrets/mariadb_databases" ]; then
+        MYSQL_DATABASES="$(read_secret "/run/secrets/mariadb_databases")"
+    elif [ -f "/run/secrets/mysql_databases" ]; then
+        MYSQL_DATABASES="$(read_secret "/run/secrets/mysql_databases")"
+    fi
+fi
+
+# Handle *_FILE for plural DATABASES
+if [ -z "${MYSQL_DATABASES:-}" ] && [ -n "${MYSQL_DATABASES_FILE:-}" ]; then
+    MYSQL_DATABASES="$(read_secret "$MYSQL_DATABASES_FILE")"
+elif [ -z "${MYSQL_DATABASES:-}" ] && [ -n "${MARIADB_DATABASES_FILE:-}" ]; then
+    MYSQL_DATABASES="$(read_secret "$MARIADB_DATABASES_FILE")"
+fi
+
+/* ---------------------------------------------------------------------- */
+/* Section: pre-init                                                      */
+/* ---------------------------------------------------------------------- */
 
 # execute any pre-init scripts
 for i in /scripts/pre-init.d/*sh
@@ -135,6 +166,22 @@ DROP DATABASE IF EXISTS test ;
 FLUSH PRIVILEGES ;
 EOF
 
+    # Helper to append SQL for creating a DB and (optionally) granting user access
+    append_db_sql() {
+        _db="$1"
+        if [ -z "$_db" ]; then
+            return
+        fi
+        if [ -n "${MYSQL_CHARSET:-}" ] && [ -n "${MYSQL_COLLATION:-}" ]; then
+            echo "CREATE DATABASE IF NOT EXISTS \`$_db\` CHARACTER SET ${MYSQL_CHARSET} COLLATE ${MYSQL_COLLATION};" >> "$tfile"
+        else
+            echo "CREATE DATABASE IF NOT EXISTS \`$_db\` CHARACTER SET utf8 COLLATE utf8_general_ci;" >> "$tfile"
+        fi
+        if [ -n "${MYSQL_USER:-}" ]; then
+            echo "GRANT ALL ON \`$_db\`.* TO '${MYSQL_USER}'@'%' IDENTIFIED BY '${MYSQL_PASSWORD}';" >> "$tfile"
+        fi
+    }
+
     if [ "$MYSQL_DATABASE" != "" ]; then
         echo "[i] Creating database: $MYSQL_DATABASE"
         if [ "$MYSQL_CHARSET" != "" ] && [ "$MYSQL_COLLATION" != "" ]; then
@@ -149,6 +196,21 @@ EOF
             echo "[i] Creating user: $MYSQL_USER with password $MYSQL_PASSWORD"
             echo "GRANT ALL ON \`$MYSQL_DATABASE\`.* to '$MYSQL_USER'@'%' IDENTIFIED BY '$MYSQL_PASSWORD';" >> "$tfile"
         fi
+    fi
+
+    # Handle multiple databases from MYSQL_DATABASES (comma/semicolon/whitespace separated)
+    if [ -n "${MYSQL_DATABASES:-}" ]; then
+        echo "[i] Creating additional databases from MYSQL_DATABASES"
+        # Normalize separators to spaces: commas and semicolons -> space
+        _dbs="$(printf '%s' "$MYSQL_DATABASES" | tr ',;' '  ')"
+        for _db in $_dbs; do
+            # Skip duplicates with the primary MYSQL_DATABASE
+            if [ -n "$MYSQL_DATABASE" ] && [ "$_db" = "$MYSQL_DATABASE" ]; then
+                continue
+            fi
+            echo "[i] - $_db"
+            append_db_sql "$_db"
+        done
     fi
 
     /usr/bin/mariadbd --user=mysql --bootstrap --verbose=0 --skip-name-resolve --skip-networking=0 < "$tfile"
@@ -189,7 +251,7 @@ EOF
         # and wait till it's done before completeing the init process
         kill -s TERM "${PID}"
         wait "${PID}"
-        rm -f TEMP_OUTPUT_LOG
+        rm -f "${TEMP_OUTPUT_LOG}"
         echo "Completed processing seed files."
     fi;
 
@@ -199,6 +261,10 @@ EOF
 
     echo "exec /usr/bin/mariadbd --user=mysql --console --skip-name-resolve --skip-networking=0" "$@"
 fi
+
+/* ---------------------------------------------------------------------- */
+/* Section: exec                                                          */
+/* ---------------------------------------------------------------------- */
 
 # execute any pre-exec scripts
 for i in /scripts/pre-exec.d/*sh
@@ -210,3 +276,7 @@ do
 done
 
 exec /usr/bin/mariadbd --user=mysql --console --skip-name-resolve --skip-networking=0 "$@"
+
+/* ---------------------------------------------------------------------- */
+/* End of file                                                            */
+/* ---------------------------------------------------------------------- */
